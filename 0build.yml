@@ -1,0 +1,150 @@
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  push:
+    branches:
+      - master
+  workflow_dispatch:  # 手动触发事件
+env:
+  CLONE_MODULES: 'unittest trial_manager device_manager drivers/driver_eeg data_manager algorithm_manager algorithm_filter'
+  MODULES: 'cjson unittest osal trial_manager device_manager drivers/driver_eeg data_manager algorithm_manager algorithm_filter'
+jobs:
+  clone_repository:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install SSH Key
+        uses: shimataro/ssh-key-action@v2.4.0
+        with:
+          key: ${{ secrets.GITEE_PRIVATE_KEY }}
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
+      - name: GIT-CLONE
+        id: set-output-modules
+        shell: bash
+        run: |
+          modules=($CLONE_MODULES)
+          git config --global user.name "robot"
+          git config --global user.email "libo_go@163.com"
+          git clone --recursive -b Lhz git@gitee.com:shubci/libs.git
+          mkdir module
+          cd module
+          git clone --recursive -b Lhz git@gitee.com:shubci/cjson.git
+          git clone --recursive -b Lhz git@gitee.com:shubci/osal.git
+          for modulename in "${modules[@]}"; do
+              git clone --recursive -b master git@gitee.com:shubci/${modulename%/*}.git
+          done
+      - name: Create markdown file
+        run: |
+          cd libs
+          echo "| module | compiler | available version | cmake result | tests_num | failures_num | ignored_num | build.log |" > result.md
+          echo "| :------: | :------: | :------: | :------: | :------: | :------: | :------: | :------: |" >> result.md
+      - name: Archive libs
+        uses: actions/upload-artifact@v2
+        with:
+          name: cloned_libs
+          path: libs
+      - name: Archive module
+        uses: actions/upload-artifact@v2
+        with:
+          name: cloned_module
+          path: module
+  process_repository:
+    needs: clone_repository
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {path: "mingw", os: "windows-latest", command: "-G", compiler: "MinGW Makefiles"}
+          - {path: "msvc", os: "windows-latest", command: "-G", compiler: "Visual Studio 17 2022"}
+          - {path: "linux", os: "ubuntu-latest", command: "", compiler: ""}
+      max-parallel: 1
+    steps:
+      - name: Download cloned_libs
+        uses: actions/download-artifact@v2
+        with:
+          name: cloned_libs
+          path: libs
+      - name: Download cloned_module
+        uses: actions/download-artifact@v2
+        with:
+          name: cloned_module
+          path: module
+      - name: Set up environment for Ubuntu
+        shell: bash
+        if: matrix.config.os == 'ubuntu-latest'
+        run: |
+          echo "$(pwd)/libs/bin/linux" | sudo tee -a /etc/ld.so.conf
+          sudo ldconfig
+          sudo apt-get update
+          sudo apt-get install libcurl4-openssl-dev
+      - name: BUILD AND INSTALL
+        shell: bash
+        run: |
+          modules=($MODULES)
+          cd libs
+          resultpath=$(pwd)/result.md
+          cd bin/${{matrix.config.path}}
+          currentDirectory=$(pwd)
+          cd ../../../module
+          modulepath=$(pwd)
+          for modulename in "${modules[@]}"; do
+              cd $modulename
+              # 编译
+              cmake ${{matrix.config.command}} "${{matrix.config.compiler}}" -S . -B ./build 2>&1 | tee ${currentDirectory}/build_${modulename##*/}_${{ matrix.config.path }}.log || true
+              # 安装
+              cmake --build ./build --target install 2>&1 | tee -a ${currentDirectory}/build_${modulename##*/}_${{ matrix.config.path }}.log || true
+              # 判断libs内版本与module内版本是否一致
+              module_version=$(grep "VERSION" version.txt | cut -d' ' -f2 | tr '\n' '.' | sed 's/\.$//')
+              available_version=$(grep "VERSION" ${currentDirectory}/${modulename##*/}_${{ matrix.config.path }}_version.txt | cut -d' ' -f2 | tr '\n' '.' | sed 's/\.$//')
+              # 两个版本号不一致，表示编译失败，不进行后续测试
+              if [ "$available_version" != "$module_version" ]
+                then
+                  echo "| ${modulename##*/} | ${{ matrix.config.path}} | $available_version | <span style="color:red">&#x274C; failed</span> | - | - | - | [build information](/bin/${{ matrix.config.path }}/build_${modulename##*/}_${{ matrix.config.path }}.log) |" >> ${resultpath}
+              else
+                  cd test
+                  cmake ${{matrix.config.command}} "${{matrix.config.compiler}}" -S . -B ./build 2>&1 | tee -a ${currentDirectory}/build_${modulename##*/}_${{ matrix.config.path }}.log || true
+                  cmake --build ./build --target install 2>&1 | tee -a ${currentDirectory}/build_${modulename##*/}_${{ matrix.config.path }}.log ||true
+                  if [ -d "bin" ]; then
+                      cd bin
+                      test_output=$(./build_test || true)
+                      tests=$(echo "$test_output" | grep -o '[0-9]\+ Tests' | grep -o '[0-9]\+') || true
+                      failures=$(echo "$test_output" | grep -o '[0-9]\+ Failures' | grep -o '[0-9]\+') || true
+                      ignored=$(echo "$test_output" | grep -o '[0-9]\+ Ignored' | grep -o '[0-9]\+') || true
+                      echo "| ${modulename##*/} | ${{ matrix.config.path}} | $available_version | <span style="color:green">&#x2705; succeeded</span> | $tests | $failures | $ignored | [build information](/bin/${{ matrix.config.path }}/build_${modulename##*/}_${{ matrix.config.path }}.log) |" >> ${resultpath}
+                  else
+                      echo "| ${modulename##*/} | ${{ matrix.config.path}} | $available_version | <span style="color:green">&#x2705; succeeded</span> | - | - | - | [build information](/bin/${{ matrix.config.path }}/build_${modulename##*/}_${{ matrix.config.path }}.log) |" >> ${resultpath}
+                  fi
+              fi
+              cd $modulepath
+          done
+          # cmake --build ./build --target package
+      - name: Archive libs
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: cloned_libs
+          path: libs
+  push_repository:
+    needs: process_repository
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Download cloned_libs
+      uses: actions/download-artifact@v2
+      with:
+        name: cloned_libs
+        path: libs
+    - name: Install SSH Key
+      uses: shimataro/ssh-key-action@v2.4.0
+      with:
+        key: ${{ secrets.GITEE_PRIVATE_KEY }}
+        known_hosts: ${{ secrets.KNOWN_HOSTS }}
+    - name: PUSH
+      run: |
+        cd libs
+        git config --global user.name "robot"
+        git config --global user.email "libo_go@163.com"
+        git status
+        git add --all && git status
+        git commit -m "ci: auto build ${{matrix.config.os}} ${{matrix.config.path}} & publish" && git config pull.rebase true && git pull && git push origin Lhz
+        git log
